@@ -282,10 +282,10 @@ const SHEET_ID = "1eby9oA3YvUsFjkAeIurAaqRbQWDDwPFR7SoZnkNgSZc";
 // then fall back to RAW DATA (large ~8k rows).
 // Add your actual Road Inventory GID here if known.
 const INV_GID = "601692646";
-const RAW_GID = "148683773";
+const RAW_GID = "1173148489";
 const SHEET_SOURCES = [
   { name:"📋 ROAD INVENTORY", gid:"601692646", type:"inventory" },
-  { name:"RAW DATA",          gid:"148683773", type:"raw" },
+  { name:"RAW DATA",          gid:"1173148489", type:"raw" },
 ];
 let rawSegMap = {}; // road name → array of segment objects (loaded in bg)
 let rawLoaded = false;
@@ -354,7 +354,7 @@ async function loadRawSegments() {
     // Build road name → segments map
     rawSegMap = {};
     result.data.forEach(r => {
-      const name = (r['R_Name'] || '').trim().toUpperCase();
+      const name = (r['R_Name'] || '').trim().toUpperCase().replace(/\s+/g,' ');
       if (!name) return;
       if (!rawSegMap[name]) rawSegMap[name] = [];
       rawSegMap[name].push({
@@ -625,7 +625,8 @@ function renderSegContent(id, roadName){
   const container = document.getElementById('segcontent-'+id);
   if(!container) return;
   // Try rawSegMap first
-  const segs = rawLoaded ? (rawSegMap[roadName] || null) : null;
+  const normName = (roadName||'').trim().toUpperCase().replace(/  +/g,' ');
+  const segs = rawLoaded ? (rawSegMap[normName] || null) : null;
   if(segs && segs.length > 0){
     const sorted = segs.slice().sort((a,b)=>(parseInt(a.rid)||0)-(parseInt(b.rid)||0));
     container.innerHTML = `<div style="overflow-x:auto">
@@ -665,7 +666,39 @@ function renderSegContent(id, roadName){
       ⏳ Loading segment details… <a href="#" onclick="renderSegContent('${id}','${roadName}');return false" style="color:var(--navy3)">Retry</a></div>`;
     setTimeout(()=>{ const r2=document.getElementById(id+'-seg'); if(!r2||r2.classList.contains('hidden')) return; renderSegContent(id,roadName); }, 2000);
   } else {
-    // rawLoaded but no data for this road
+    // rawLoaded but no exact match — try partial match
+    const normName2 = (roadName||'').trim().toUpperCase().replace(/  +/g,' ');
+    const partialKey = Object.keys(rawSegMap).find(k => k.includes(normName2) || normName2.includes(k));
+    const fallbackSegs = partialKey ? rawSegMap[partialKey] : null;
+    if (fallbackSegs && fallbackSegs.length > 0) {
+      // found via partial match — re-render with those segs
+      const segs2 = fallbackSegs;
+      const sorted2 = segs2.slice().sort((a,b)=>(parseInt(a.rid)||0)-(parseInt(b.rid)||0));
+      container.innerHTML = `<div style="overflow-x:auto">
+        <table class="mtbl" style="margin:0;border-radius:0;font-size:.73rem">
+          <thead><tr>
+            <th>R_ID</th><th>Surface Type</th><th>Condition</th>
+            <th style="text-align:right">Width (m)</th><th style="text-align:right">Length (m)</th>
+            <th>Barangay</th><th>District</th><th>Classification</th>
+            <th>Importance</th><th>Lanes</th><th>Remarks</th>
+          </tr></thead>
+          <tbody>
+            ${sorted2.map(s=>`<tr>
+              <td><strong>${esc(String(s.rid))}</strong></td>
+              <td>${esc(s.stype)}</td>
+              <td>${condBadge(s.rcon||'For Inspection')}</td>
+              <td style="text-align:right">${s.width}</td>
+              <td style="text-align:right">${s.lenM>0?s.lenM.toFixed(2):'—'}</td>
+              <td>${esc(s.brgy)}</td><td>${esc(s.dist)}</td>
+              <td>${s.rclass!=='—'?`<span class="badge bg-insp">${esc(s.rclass)}</span>`:'—'}</td>
+              <td>${esc(s.rimp)}</td>
+              <td style="text-align:right">${s.nlanes}</td>
+              <td style="font-size:.68rem;color:var(--muted)">${esc(s.remarks)}</td>
+            </tr>`).join('')}
+          </tbody>
+        </table></div>`;
+      return;
+    }
     const rd = allRoads.find(r=>r.name===roadName);
     container.innerHTML = `<div style="padding:12px 16px;color:var(--muted);font-size:.78rem">
       <strong>${rd?rd.segs:0} segment(s)</strong> — R_ID range: ${rd?rd.ridRange||'—':'—'}<br>
