@@ -281,14 +281,14 @@ const SHEET_ID = "1eby9oA3YvUsFjkAeIurAaqRbQWDDwPFR7SoZnkNgSZc";
 // We try the ROAD INVENTORY sheet first (pre-processed, small),
 // then fall back to RAW DATA (large ~8k rows).
 // Add your actual Road Inventory GID here if known.
+const INV_GID = "601692646";
+const RAW_GID = "148683773";
 const SHEET_SOURCES = [
   { name:"📋 ROAD INVENTORY", gid:"601692646", type:"inventory" },
-  { name:"📋 ROAD INVENTORY", gid:"1",          type:"inventory" },
-  { name:"📋 ROAD INVENTORY", gid:"2",          type:"inventory" },
-  { name:"📋 ROAD INVENTORY", gid:"3",          type:"inventory" },
-  { name:"📋 ROAD INVENTORY", gid:"4",          type:"inventory" },
-  { name:"RAW DATA",          gid:"148683773",  type:"raw" },
+  { name:"RAW DATA",          gid:"148683773", type:"raw" },
 ];
+let rawSegMap = {}; // road name → array of segment objects (loaded in bg)
+let rawLoaded = false;
 
 const RATES={Bad:{Asphalt:6500,Concrete:8000,Gravel:3500,Earth:2500,Mixed:5000,Unclassified:5000},
   Poor:{Asphalt:1800,Concrete:2200,Gravel:900,Earth:700,Mixed:1200,Unclassified:1200},
@@ -298,40 +298,87 @@ const RATES={Bad:{Asphalt:6500,Concrete:8000,Gravel:3500,Earth:2500,Mixed:5000,U
 let allRoads=[],filtRoads=[],srtCol='len',srtDir=-1,pg=1;
 const PG=25;
 
-// ── FETCH: try each GID until one returns valid data ──
+// ── FETCH inventory first, then load raw segments in background ──
 async function loadData(){
+  rawLoaded = false; rawSegMap = {};
   setStep('Connecting to Google Sheets…');
   showLoad();
-  for(const src of SHEET_SOURCES){
-    try{
-      setStep('Trying '+src.name+'…');
-      const url=`https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=${src.gid}`;
-      const res=await fetch(url,{cache:'no-cache'});
-      if(!res.ok) continue;
-      const text=await res.text();
-      if(!text||text.length<100) continue;
-      const result=Papa.parse(text,{header:true,skipEmptyLines:true});
-      if(!result.data||result.data.length<2) continue;
-      const headers=Object.keys(result.data[0]);
-      // Detect which sheet we got based on headers
-      if(src.type==='inventory'&&headers.includes('Road Name')){
-        setStep('Processing Road Inventory…');
-        processInventory(result.data);
+  try {
+    // Step 1: Load Road Inventory (small, fast)
+    setStep('Loading Road Inventory…');
+    const invUrl = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=${INV_GID}`;
+    const invRes = await fetch(invUrl, {cache:'no-cache'});
+    if (invRes.ok) {
+      const invText = await invRes.text();
+      const invResult = Papa.parse(invText, {header:true, skipEmptyLines:true});
+      if (invResult.data && invResult.data.length > 1 && Object.keys(invResult.data[0]).includes('Road Name')) {
+        processInventory(invResult.data);
         hideLoad();
         clearErr();
-        return;
-      } else if(src.type==='raw'&&(headers.includes('R_Name')||headers.includes('r_name'))){
-        setStep('Processing RAW DATA ('+result.data.length+' rows)…');
-        processRaw(result.data);
-        hideLoad();
-        clearErr();
+        // Step 2: Load RAW DATA in background for segment details
+        loadRawSegments();
         return;
       }
-    } catch(e){ console.warn('GID '+src.gid+' failed:',e.message); }
+    }
+    // Fallback: load RAW DATA directly
+    setStep('Loading RAW DATA…');
+    const rawUrl = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=${RAW_GID}`;
+    const rawRes = await fetch(rawUrl, {cache:'no-cache'});
+    if (rawRes.ok) {
+      const rawText = await rawRes.text();
+      const rawResult = Papa.parse(rawText, {header:true, skipEmptyLines:true});
+      if (rawResult.data && rawResult.data.length > 1) {
+        processRaw(rawResult.data);
+        hideLoad();
+        clearErr();
+        rawLoaded = true;
+        return;
+      }
+    }
+    throw new Error('Both sheet sources failed');
+  } catch(e) {
+    hideLoad();
+    showErr('⚠️ Could not load data. Make sure the spreadsheet is shared publicly. <a href="https://docs.google.com/spreadsheets/d/'+SHEET_ID+'" target="_blank" style="color:var(--navy3)">Open Spreadsheet</a>');
   }
-  // All failed
-  hideLoad();
-  showErr('⚠️ Could not load data. Make sure the spreadsheet is shared publicly (Anyone with link → Viewer) and published to web (File → Share → Publish to web → CSV). <a href="https://docs.google.com/spreadsheets/d/'+SHEET_ID+'" target="_blank" style="color:var(--navy3)">Open Spreadsheet</a>');
+}
+
+// Load RAW DATA in background and build segment lookup map
+async function loadRawSegments() {
+  try {
+    const url = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=${RAW_GID}`;
+    const res = await fetch(url, {cache:'no-cache'});
+    if (!res.ok) return;
+    const text = await res.text();
+    const result = Papa.parse(text, {header:true, skipEmptyLines:true});
+    if (!result.data || result.data.length < 2) return;
+    // Build road name → segments map
+    rawSegMap = {};
+    result.data.forEach(r => {
+      const name = (r['R_Name'] || '').trim().toUpperCase();
+      if (!name) return;
+      if (!rawSegMap[name]) rawSegMap[name] = [];
+      rawSegMap[name].push({
+        rid:     r['R_ID']      || '—',
+        stype:   r['S_Type']    || 'Unclassified',
+        rcon:    r['R_Con']     || '—',
+        width:   r['R_Width']   || '—',
+        lenM:    parseFloat(r['LENGTH (M)'] || r['R_Length'] || 0),
+        brgy:    r['Brgy_Name'] || '—',
+        dist:    r['DISTRICT']  || '—',
+        rclass:  r['R_Class']   || '—',
+        rimp:    r['R_Importan']|| '—',
+        remarks: r['REMARKS']   || '—',
+        inspector: r['INSPECTOR'] || '—',
+        updated: r['DATE UPDATED'] || '—',
+        nlanes:  r['N_Lanes']   || '—',
+      });
+    });
+    rawLoaded = true;
+    // Re-render table so open dropdowns get real data
+    renderTable();
+  } catch(e) {
+    console.warn('Background raw load failed:', e.message);
+  }
 }
 
 // ── Process pre-built ROAD INVENTORY sheet ──
@@ -427,7 +474,7 @@ function renderKPIs(){
     (r.brgys||'').split(',').forEach(b=>{const t=b.trim();if(t)brgys.add(t);});
   });
   set('vSegs',segs.toLocaleString());
-  set('vLen',(len/1000).toFixed(1)+' km');
+  set('vLen',len.toFixed(1)+' km');
   set('vBrgy',brgys.size);
   set('vBad',bad); set('vPoor',poor); set('vFair',fair); set('vGood',good);
   set('vInsp',inspect.toLocaleString());
@@ -492,7 +539,7 @@ function renderDistricts(){
       <div class="dist-name">${d==='UNSPECIFIED'?'Unspecified':d} District</div>
       <div class="dist-stats">
         <div class="ds"><span class="ds-v">${v.total.toLocaleString()}</span><br><span class="ds-l">Roads</span></div>
-        <div class="ds"><span class="ds-v">${(v.len/1000).toFixed(1)} km</span><br><span class="ds-l">Length</span></div>
+        <div class="ds"><span class="ds-v">${v.len.toFixed(1)} km</span><br><span class="ds-l">Length</span></div>
         <div class="ds"><span class="ds-v" style="color:var(--bad)">${v.bad}</span><br><span class="ds-l">Bad</span></div>
         <div class="ds"><span class="ds-v" style="color:var(--poor)">${v.poor}</span><br><span class="ds-l">Poor</span></div>
         <div class="ds"><span class="ds-v" style="color:#b8a000">${v.fair}</span><br><span class="ds-l">Fair</span></div>
@@ -545,7 +592,7 @@ function renderTable(){
     tr.innerHTML=`<td><button class="expand-btn" id="btn-${rid}" onclick="toggleSeg('${rid}',this)">▶</button></td>
       <td><strong>${esc(rd.name)}</strong></td>
       <td>${rd.rclass?`<span class="badge bg-insp">${esc(rd.rclass)}</span>`:'—'}</td>
-      <td class="nr">${(rd.lenKm/1000).toFixed(3)}</td>
+      <td class="nr">${rd.lenKm.toFixed(3)}</td>
       <td>${condBadge(rd.genCon)}</td>
       <td class="nr">${rd.segs}</td>
       <td>${rd.dist||'—'}</td>
@@ -555,21 +602,10 @@ function renderTable(){
     // Segment detail row
     const sr=document.createElement('tr');
     sr.className='seg-row hidden'; sr.id=rid+'-seg';
-    let segContent='';
-    if(rd.rawSegs&&rd.rawSegs.length>0){
-      segContent=`<table class="mtbl" style="margin:0;border-radius:0"><thead><tr>
-        <th>R_ID</th><th>Surface</th><th>Condition</th><th>Width(m)</th><th>Length(m)</th><th>Barangay</th><th>Remarks</th>
-        </tr></thead><tbody>${rd.rawSegs.sort((a,b)=>(parseInt(a.rid)||0)-(parseInt(b.rid)||0)).map(s=>
-        `<tr><td>${s.rid||'—'}</td><td>${esc(s.stype)}</td><td>${condBadge(s.rcon||'For Inspection')}</td>
-        <td class="nr">${s.width||'—'}</td><td class="nr">${s.lenM.toFixed(2)}</td>
-        <td>${esc(s.brgy)||'—'}</td><td>${esc(s.remarks)||'—'}</td></tr>`).join('')}
-        </tbody></table>`;
-    } else {
-      segContent=`<div style="padding:10px;color:var(--muted);font-size:.78rem">
-        ${rd.segs} segment(s) — R_ID range: ${rd.ridRange||'—'}<br>
-        <em>Detailed segment data available in RAW DATA sheet.</em></div>`;
-    }
-    sr.innerHTML=`<td></td><td colspan="7" style="padding:0">${segContent}</td>`;
+    sr.dataset.roadName = rd.name; // store for lazy render
+    sr.innerHTML=`<td></td><td colspan="7" style="padding:0" id="segcontent-${rid}">
+      <div style="padding:12px 16px;color:var(--muted);font-size:.78rem;font-style:italic">
+        Loading segment details…</div></td>`;
     tb.appendChild(sr);
   });
   renderPagi();
@@ -578,9 +614,63 @@ function renderTable(){
 function toggleSeg(id,btn){
   const row=document.getElementById(id+'-seg');
   if(!row) return;
-  const open=!row.classList.contains('hidden');
-  row.classList.toggle('hidden',open);
-  btn.classList.toggle('open',!open);
+  const isOpen=!row.classList.contains('hidden');
+  row.classList.toggle('hidden',isOpen);
+  btn.classList.toggle('open',!isOpen);
+  // Render segment content when opening
+  if(!isOpen){ renderSegContent(id, row.dataset.roadName); }
+}
+
+function renderSegContent(id, roadName){
+  const container = document.getElementById('segcontent-'+id);
+  if(!container) return;
+  // Try rawSegMap first
+  const segs = rawLoaded ? (rawSegMap[roadName] || null) : null;
+  if(segs && segs.length > 0){
+    const sorted = segs.slice().sort((a,b)=>(parseInt(a.rid)||0)-(parseInt(b.rid)||0));
+    container.innerHTML = `<div style="overflow-x:auto">
+      <table class="mtbl" style="margin:0;border-radius:0;font-size:.73rem">
+        <thead><tr>
+          <th>R_ID</th>
+          <th>Surface Type</th>
+          <th>Condition</th>
+          <th style="text-align:right">Width (m)</th>
+          <th style="text-align:right">Length (m)</th>
+          <th>Barangay</th>
+          <th>District</th>
+          <th>Classification</th>
+          <th>Importance</th>
+          <th>Lanes</th>
+          <th>Remarks</th>
+        </tr></thead>
+        <tbody>
+          ${sorted.map(s=>`<tr>
+            <td><strong>${esc(String(s.rid))}</strong></td>
+            <td>${esc(s.stype)}</td>
+            <td>${condBadge(s.rcon||'For Inspection')}</td>
+            <td style="text-align:right">${s.width}</td>
+            <td style="text-align:right">${s.lenM>0?s.lenM.toFixed(2):'—'}</td>
+            <td>${esc(s.brgy)}</td>
+            <td>${esc(s.dist)}</td>
+            <td>${s.rclass!=='—'?`<span class="badge bg-insp">${esc(s.rclass)}</span>`:'—'}</td>
+            <td>${esc(s.rimp)}</td>
+            <td style="text-align:right">${s.nlanes}</td>
+            <td style="font-size:.68rem;color:var(--muted)">${esc(s.remarks)}</td>
+          </tr>`).join('')}
+        </tbody>
+      </table></div>`;
+  } else if(!rawLoaded){
+    // Still loading — poll until ready
+    container.innerHTML = `<div style="padding:12px 16px;color:var(--muted);font-size:.78rem">
+      ⏳ Loading segment details… <a href="#" onclick="renderSegContent('${id}','${roadName}');return false" style="color:var(--navy3)">Retry</a></div>`;
+    setTimeout(()=>{ const r2=document.getElementById(id+'-seg'); if(!r2||r2.classList.contains('hidden')) return; renderSegContent(id,roadName); }, 2000);
+  } else {
+    // rawLoaded but no data for this road
+    const rd = allRoads.find(r=>r.name===roadName);
+    container.innerHTML = `<div style="padding:12px 16px;color:var(--muted);font-size:.78rem">
+      <strong>${rd?rd.segs:0} segment(s)</strong> — R_ID range: ${rd?rd.ridRange||'—':'—'}<br>
+      No detailed segment data found for this road in RAW DATA.</div>`;
+  }
 }
 
 function renderPagi(){
@@ -602,7 +692,7 @@ function showModal(type){
   const segs=r=>r.bad+r.poor+r.fair+r.good+r.inspect;
   if(type==='length'){
     const byClass={};
-    allRoads.forEach(r=>{const c=r.rclass||'Unclassified';if(!byClass[c])byClass[c]={len:0,roads:0};byClass[c].len+=r.lenKm/1000;byClass[c].roads++;});
+    allRoads.forEach(r=>{const c=r.rclass||'Unclassified';if(!byClass[c])byClass[c]={len:0,roads:0};byClass[c].len+=r.lenKm;byClass[c].roads++;});
     const tot=Object.values(byClass).reduce((a,v)=>a+v.len,0)||1;
     openModal('Total Length by Road Classification',
       `<div class="mstats">
@@ -619,7 +709,7 @@ function showModal(type){
       const t=b.trim();if(!t)return;
       if(!bm[t])bm[t]={dist:r.dist||'',roads:0,bad:0,poor:0,fair:0,good:0,inspect:0,len:0,cost:0};
       bm[t].roads++;bm[t].bad+=r.bad;bm[t].poor+=r.poor;bm[t].fair+=r.fair;
-      bm[t].good+=r.good;bm[t].inspect+=r.inspect;bm[t].len+=r.lenKm/1000;bm[t].cost+=r.cost;
+      bm[t].good+=r.good;bm[t].inspect+=r.inspect;bm[t].len+=r.lenKm;bm[t].cost+=r.cost;
     }));
     openModal('Barangay Priority Summary',
       `<div class="mstats">
@@ -651,7 +741,7 @@ function showModal(type){
       `<div class="mstats">
         <div class="mstat"><div class="mstat-v">${roads.length.toLocaleString()}</div><div class="mstat-l">Roads Affected</div></div>
         <div class="mstat"><div class="mstat-v">${roads.reduce((a,r)=>a+(r[type==='inspect'?'inspect':type]||0),0).toLocaleString()}</div><div class="mstat-l">Segments</div></div>
-        <div class="mstat"><div class="mstat-v">${(roads.reduce((a,r)=>a+r.lenKm,0)/1000).toFixed(2)} km</div><div class="mstat-l">Total Length</div></div>
+        <div class="mstat"><div class="mstat-v">${roads.reduce((a,r)=>a+r.lenKm,0).toFixed(2)} km</div><div class="mstat-l">Total Length</div></div>
       </div>
       <table class="mtbl"><thead><tr>
         <th onclick="srtModal(this,0)">Road Name</th><th onclick="srtModal(this,1)">District</th>
@@ -663,7 +753,7 @@ function showModal(type){
         <td style="font-size:.72rem">${esc(r.brgys)||'—'}</td>
         <td style="font-size:.72rem">${esc(r.stype)||'—'}</td>
         <td class="nr">${r[type==='inspect'?'inspect':type]}</td>
-        <td class="nr">${(r.lenKm/1000).toFixed(3)}</td>
+        <td class="nr">${r.lenKm.toFixed(3)}</td>
       </tr>`).join('')}
       </tbody></table>`);
   } else if(type==='cost'){
@@ -671,7 +761,7 @@ function showModal(type){
     allRoads.forEach(r=>{
       ['bad','poor','fair','good'].forEach(c=>{
         if(r[c]>0){if(!bycon[c])bycon[c]={roads:0,segs:0,len:0,cost:0};
-          bycon[c].roads++;bycon[c].segs+=r[c];bycon[c].len+=r.lenKm/1000;bycon[c].cost+=r.cost;}
+          bycon[c].roads++;bycon[c].segs+=r[c];bycon[c].len+=r.lenKm;bycon[c].cost+=r.cost;}
       });
     });
     const totCost=allRoads.reduce((a,r)=>a+r.cost,0);
